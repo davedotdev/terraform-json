@@ -1,6 +1,9 @@
 package tfjson
 
-import "errors"
+import (
+	"encoding/json"
+	"errors"
+)
 
 // Config represents the complete configuration source
 type Config struct {
@@ -90,7 +93,7 @@ type ConfigResource struct {
 
 	// Any non-special configuration values in the resource, indexed by
 	// key.
-	Expressions map[string]Expression `json:"expressions,omitempty"`
+	Expressions map[string]Expression
 
 	// The resource's configuration schema version. With access to the
 	// specific Terraform provider for this resource, this can be used
@@ -103,6 +106,67 @@ type ConfigResource struct {
 
 	// The expression data for the "for_each" value in the resource.
 	ForEachExpression *Expression `json:"for_each_expression,omitempty"`
+
+	// RawExpressions represents the raw JSON expression data, which
+	// requires special handling to deal with nested blocks. This field
+	// is internal and used only during parsing.
+	RawExpressions map[string]json.RawMessage `json:"expressions,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler for ConfigResource.
+func (r *ConfigResource) UnmarshalJSON(b []byte) error {
+	if err := json.Unmarshal(b, &r); err != nil {
+		return err
+	}
+
+	r.Expressions = make(map[string]Expression)
+	for k, raw := range r.RawExpressions {
+		expr, err := unmarshalExpression(raw)
+		if err != nil {
+			return err
+		}
+
+		r.Expressions[k] = expr
+	}
+
+	r.RawExpressions = nil
+	return nil
+}
+
+func unmarshalExpression(raw json.RawMessage) (Expression, error) {
+	// Check to see if this is an array first. If it is, this is more
+	// than likely a list of nested blocks.
+	var rawNested []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rawNested); err == nil {
+		return unmarshalExpressionBlocks(rawNested)
+	}
+
+	var result Expression
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return Expression{}, err
+	}
+
+	return result, nil
+}
+
+func unmarshalExpressionBlocks(raw []map[string]json.RawMessage) (Expression, error) {
+	var result Expression
+
+	for _, rawBlock := range raw {
+		block := make(map[string]Expression)
+		for k, rawExpr := range rawBlock {
+			expr, err := unmarshalExpression(rawExpr)
+			if err != nil {
+				return Expression{}, err
+			}
+
+			block[k] = expr
+		}
+
+		result.NestedBlocks = append(result.NestedBlocks, block)
+	}
+
+	return result, nil
 }
 
 // ConfigVariable defines a variable as defined in configuration.
@@ -159,4 +223,10 @@ type Expression struct {
 	// able to be resolved at parse-time, this will contain a list of
 	// the referenced identifiers that caused the value to be unknown.
 	References []string `json:"references,omitempty"`
+
+	// A list of complex objects that were nested in this expression.
+	// If this value is a nested block in configuration, sometimes
+	// referred to as a "sub-resource", this field will contain those
+	// values, and ConstantValue and References will be blank.
+	NestedBlocks []map[string]Expression
 }
